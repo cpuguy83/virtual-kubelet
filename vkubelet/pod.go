@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cpuguy83/strongerrors"
 	"github.com/cpuguy83/strongerrors/status/ocstatus"
-
 	pkgerrors "github.com/pkg/errors"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	"go.opencensus.io/trace"
@@ -17,7 +17,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/kubernetes/staging/src/k8s.io/client-go/util/workqueue"
 )
+
+const maxRequeus = 5
 
 func addPodAttributes(span *trace.Span, pod *corev1.Pod) {
 	span.AddAttributes(
@@ -29,115 +32,99 @@ func addPodAttributes(span *trace.Span, pod *corev1.Pod) {
 	)
 }
 
-func (s *Server) onAddPod(ctx context.Context, obj interface{}) {
-	ctx, span := trace.StartSpan(ctx, "onAddPod")
-	defer span.End()
-	logger := log.G(ctx).WithField("method", "onAddPod")
-
-	pod, ok := obj.(*corev1.Pod)
-	if !ok {
-		span.SetStatus(trace.Status{Code: trace.StatusCodeInvalidArgument, Message: fmt.Sprintf("Unexpected object from event: %T", obj)})
-		logger.Errorf("obj is not of a valid type: %T", obj)
-		return
-	}
-
-	addPodAttributes(span, pod)
-
-	logger.Debugf("Receive added pod '%s/%s' ", pod.GetNamespace(), pod.GetName())
-
-	if s.resourceManager.UpdatePod(pod) {
-		span.Annotate(nil, "Add pod to synchronizer channel.")
-		select {
-		case <-ctx.Done():
-			logger = logger.WithField("pod", pod.GetName()).WithField("namespace", pod.GetNamespace())
-			logger.WithError(ctx.Err()).Debug("Cancel send pod event due to cancelled context")
-			return
-		case s.podCh <- &podNotification{pod: pod, ctx: ctx}:
-		}
-	}
-}
-
-func (s *Server) onUpdatePod(ctx context.Context, obj interface{}) {
-	ctx, span := trace.StartSpan(ctx, "onUpdatePod")
-	defer span.End()
-	logger := log.G(ctx).WithField("method", "onUpdatePod")
-
-	pod, ok := obj.(*corev1.Pod)
-	if !ok {
-		span.SetStatus(trace.Status{Code: trace.StatusCodeInvalidArgument, Message: fmt.Sprintf("Unexpected object from event: %T", obj)})
-		logger.Errorf("obj is not of a valid type: %T", obj)
-		return
-	}
-
-	addPodAttributes(span, pod)
-
-	logger.Debugf("Receive updated pod '%s/%s'", pod.GetNamespace(), pod.GetName())
-
-	if s.resourceManager.UpdatePod(pod) {
-		span.Annotate(nil, "Add pod to synchronizer channel.")
-		select {
-		case <-ctx.Done():
-			logger = logger.WithField("pod", pod.GetName()).WithField("namespace", pod.GetNamespace())
-			logger.WithError(ctx.Err()).Debug("Cancel send pod event due to cancelled context")
-			return
-		case s.podCh <- &podNotification{pod: pod, ctx: ctx}:
-		}
-	}
-}
-
-func (s *Server) onDeletePod(ctx context.Context, obj interface{}) {
-	ctx, span := trace.StartSpan(ctx, "onDeletePod")
-	defer span.End()
-	logger := log.G(ctx).WithField("method", "onDeletePod")
-
-	pod, ok := obj.(*corev1.Pod)
-	if !ok {
-		delta, ok := obj.(cache.DeletedFinalStateUnknown)
-		if !ok {
-			span.SetStatus(trace.Status{Code: trace.StatusCodeInvalidArgument, Message: fmt.Sprintf("Unexpected object from event: %T", obj)})
-			logger.Errorf("obj is not of a valid type: %T", obj)
-			return
-		}
-
-		if pod, ok = delta.Obj.(*corev1.Pod); !ok {
-			span.SetStatus(trace.Status{Code: trace.StatusCodeInvalidArgument, Message: fmt.Sprintf("Unexpected object from event: %T", obj)})
-			logger.Errorf("obj is not of a valid type: %T", obj)
-			return
-		}
-	}
-
-	addPodAttributes(span, pod)
-
-	logger.Debugf("Receive deleted pod '%s/%s'", pod.GetNamespace(), pod.GetName())
-
-	if s.resourceManager.DeletePod(pod) {
-		span.Annotate(nil, "Add pod to synchronizer channel.")
-		select {
-		case <-ctx.Done():
-			logger = logger.WithField("pod", pod.GetName()).WithField("namespace", pod.GetNamespace())
-			logger.WithError(ctx.Err()).Debug("Cancel send pod event due to cancelled context")
-			return
-		case s.podCh <- &podNotification{pod: pod, ctx: ctx}:
-		}
-	}
-}
-
 func (s *Server) startPodSynchronizer(ctx context.Context, id int) {
 	logger := log.G(ctx).WithField("method", "startPodSynchronizer").WithField("podSynchronizer", id)
 	logger.Debug("Start pod synchronizer")
+	id64 := int64(id)
 
 	for {
-		select {
-		case <-ctx.Done():
-			logger.Info("Stop pod syncronizer")
+		e, quit := s.queue.Get()
+		if quit {
 			return
-		case event := <-s.podCh:
-			s.syncPod(event.ctx, event.pod)
 		}
+
+		// Let this panic if this is not an event, because this is all that should be there
+		// Items in the queue are all managed by us and would be a serious bug if it's an unexected type.
+		event := e.(event)
+
+		func() {
+			ctx, span := trace.StartSpan(event.ctx, "processEvent")
+			defer span.End()
+
+			retries := s.queue.NumRequeues(e)
+			span.AddAttributes(
+				trace.Int64Attribute("workerID", id64),
+				trace.StringAttribute("key", event.key),
+				trace.Int64Attribute("retries", int64(retries)),
+			)
+
+			defer s.queue.Done(event.key)
+
+			obj, exists, err := s.informer.GetStore().GetByKey(event.key)
+			if err != nil {
+				span.SetStatus(ocstatus.FromError(err))
+				log.G(ctx).WithError(err).Error("Error looking up object from cache store")
+				return
+			}
+
+			if !exists && obj == nil {
+				span.Annotate(nil, "could not find object in store, nothing to do")
+				log.G(ctx).Debug("Could not find object in store, nothing to do")
+				return
+			}
+
+			var pod *corev1.Pod
+			switch t := obj.(type) {
+			case *corev1.Pod:
+				pod = t
+			case *cache.DeletedFinalStateUnknown:
+				p, ok := t.Obj.(*corev1.Pod)
+				if !ok {
+					span.SetStatus(trace.Status{Code: trace.StatusCodeInvalidArgument, Message: fmt.Sprintf("unxpected type on event: %T", t.Obj)})
+					log.G(ctx).WithField("key", event.key).Errorf("Got unexpected type on event: %T", t.Obj)
+					return
+				}
+				pod = p
+			default:
+				span.SetStatus(trace.Status{Code: trace.StatusCodeInvalidArgument, Message: fmt.Sprintf("unxpected type on event: %T", obj)})
+				log.G(ctx).WithField("key", event.key).Errorf("Got unexpected type on event: %T", obj)
+				return
+			}
+
+			logger := log.G(ctx).WithField("pod", pod.GetName()).WithField("namespace", pod.GetNamespace()).WithField("retries", retries)
+			addPodAttributes(span, pod)
+
+			if !s.resourceManager.UpdatePod(pod) {
+				span.Annotate(nil, "no pod update required")
+				log.Trace(logger, "nothing to do")
+				return
+			}
+
+			if err := s.syncPod(ctx, pod); err != nil {
+				logger.WithError(err).Error("error syncing pod")
+				span.SetStatus(ocstatus.FromError(err))
+
+				if retries > maxRequeus {
+					s.queue.Forget(e)
+					span.Annotate(nil, "not requeueing")
+					log.Trace(logger, "not requeuing")
+					return
+				}
+
+				log.Trace(logger, "requeueing event")
+				s.queue.AddRateLimited(e)
+				span.Annotate(nil, "requeued event")
+				return
+			}
+
+			s.queue.Forget(e)
+			span.Annotate(nil, "pod synced")
+			log.Trace(logger, "pod synced")
+		}()
 	}
 }
 
-func (s *Server) syncPod(ctx context.Context, pod *corev1.Pod) {
+func (s *Server) syncPod(ctx context.Context, pod *corev1.Pod) error {
 	ctx, span := trace.StartSpan(ctx, "syncPod")
 	defer span.End()
 	logger := log.G(ctx).WithField("pod", pod.GetName()).WithField("namespace", pod.GetNamespace())
@@ -146,21 +133,28 @@ func (s *Server) syncPod(ctx context.Context, pod *corev1.Pod) {
 
 	if pod.DeletionTimestamp != nil ||
 		s.resourceManager.GetPod(pod.GetNamespace(), pod.GetName()) == nil {
-		span.Annotate(nil, "Delete pod")
 		logger.Debugf("Deleting pod")
 		if err := s.deletePod(ctx, pod); err != nil {
-			logger.WithError(err).Error("Failed to delete pod")
-			time.AfterFunc(5*time.Second, func() {
-				s.podCh <- &podNotification{pod: pod, ctx: ctx}
-			})
+			span.SetStatus(ocstatus.FromError(err))
+			return err
 		}
+		span.Annotate(nil, "pod deleted")
 	} else {
-		span.Annotate(nil, "Create pod")
+		if pod.Status.Phase == corev1.PodFailed {
+			logger.Debug("skipping failed pod")
+			span.Annotate(nil, "skipping failed pod")
+			return nil
+		}
+
 		logger.Debugf("Creating pod")
 		if err := s.createPod(ctx, pod); err != nil {
-			logger.WithError(err).Errorf("Failed to create pod")
+			span.SetStatus(ocstatus.FromError(err))
+			return err
 		}
+		span.Annotate(nil, "pod created")
 	}
+
+	return nil
 }
 
 func (s *Server) createPod(ctx context.Context, pod *corev1.Pod) error {
@@ -196,8 +190,8 @@ func (s *Server) createPod(ctx context.Context, pod *corev1.Pod) error {
 		span.SetStatus(trace.Status{Code: trace.StatusCodeUnknown, Message: origErr.Error()})
 		return origErr
 	}
-	span.Annotate(nil, "Created pod in provider")
 
+	span.Annotate(nil, "Created pod in provider")
 	logger.Info("Pod created")
 
 	return nil
@@ -209,7 +203,10 @@ func (s *Server) deletePod(ctx context.Context, pod *corev1.Pod) error {
 	addPodAttributes(span, pod)
 
 	var delErr error
-	if delErr = s.provider.DeletePod(ctx, pod); delErr != nil && !errors.IsNotFound(delErr) {
+	if delErr = s.provider.DeletePod(ctx, pod); delErr != nil {
+		if strongerrors.IsNotFound(delErr) {
+			span.SetStatus(ocstatus.FromError(delErr))
+		}
 		span.SetStatus(trace.Status{Code: trace.StatusCodeUnknown, Message: delErr.Error()})
 		return delErr
 	}
@@ -217,7 +214,7 @@ func (s *Server) deletePod(ctx context.Context, pod *corev1.Pod) error {
 
 	logger := log.G(ctx).WithField("pod", pod.GetName()).WithField("namespace", pod.GetNamespace())
 	var grace int64
-	if err := s.k8sClient.CoreV1().Pods(pod.GetNamespace()).Delete(pod.GetName(), &metav1.DeleteOptions{GracePeriodSeconds: &grace}); err != nil && errors.IsNotFound(err) {
+	if err := s.k8sClient.CoreV1().Pods(pod.GetNamespace()).Delete(pod.GetName(), &metav1.DeleteOptions{GracePeriodSeconds: &grace}); err != nil {
 		if errors.IsNotFound(err) {
 			span.Annotate(nil, "Pod does not exist in k8s, nothing to delete")
 			return nil
@@ -241,15 +238,20 @@ func (s *Server) updatePodStatuses(ctx context.Context) {
 	defer span.End()
 
 	// Update all the pods with the provider status.
-	pods := s.resourceManager.GetPods()
-	span.AddAttributes(trace.Int64Attribute("nPods", int64(len(pods))))
+	ls := s.informer.GetStore().List()
+	span.AddAttributes(trace.Int64Attribute("nPods", int64(len(ls))))
 
-	for _, pod := range pods {
+	for _, i := range ls {
 		select {
 		case <-ctx.Done():
 			span.Annotate(nil, ctx.Err().Error())
 			return
 		default:
+		}
+
+		pod, ok := i.(*corev1.Pod)
+		if !ok {
+			continue
 		}
 
 		if err := s.updatePodStatus(ctx, pod); err != nil {
@@ -288,12 +290,16 @@ func (s *Server) updatePodStatus(ctx context.Context, pod *corev1.Pod) error {
 			pod.Status.Reason = "NotFound"
 			pod.Status.Message = "The pod status was not found and may have been deleted from the provider"
 			for i, c := range pod.Status.ContainerStatuses {
+				var startedAt metav1.Time
+				if c.State.Running != nil {
+					startedAt = c.State.Running.StartedAt
+				}
 				pod.Status.ContainerStatuses[i].State.Terminated = &corev1.ContainerStateTerminated{
 					ExitCode:    -137,
 					Reason:      "NotFound",
 					Message:     "Container was not found and was likely deleted",
 					FinishedAt:  metav1.NewTime(time.Now()),
-					StartedAt:   c.State.Running.StartedAt,
+					StartedAt:   startedAt,
 					ContainerID: c.ContainerID,
 				}
 				pod.Status.ContainerStatuses[i].State.Running = nil
@@ -313,6 +319,11 @@ func (s *Server) updatePodStatus(ctx context.Context, pod *corev1.Pod) error {
 	return nil
 }
 
+type event struct {
+	ctx context.Context
+	key string
+}
+
 // watchForPodEvent waits for pod changes from kubernetes and updates the details accordingly in the local state.
 // This returns after a single pod event.
 func (s *Server) watchForPodEvent(ctx context.Context) error {
@@ -320,61 +331,100 @@ func (s *Server) watchForPodEvent(ctx context.Context) error {
 		FieldSelector: fields.OneTermEqualSelector("spec.nodeName", s.nodeName).String(),
 	}
 
-	pods, err := s.k8sClient.CoreV1().Pods(s.namespace).List(opts)
-	if err != nil {
-		return pkgerrors.Wrap(err, "error getting pod list")
+	lw := &cache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			if s.informer != nil {
+				opts.ResourceVersion = s.informer.GetController().LastSyncResourceVersion()
+			}
+
+			return s.k8sClient.Core().Pods(s.namespace).List(opts)
+		},
+
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			if s.informer != nil {
+				opts.ResourceVersion = s.informer.GetController().LastSyncResourceVersion()
+			}
+
+			return s.k8sClient.Core().Pods(s.namespace).Watch(opts)
+		},
 	}
 
-	s.resourceManager.SetPods(pods)
-	s.reconcile(ctx)
+	q := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+	s.queue = q
 
-	opts.ResourceVersion = pods.ResourceVersion
+	s.informer = cache.NewSharedInformer(lw, &corev1.Pod{}, time.Minute)
+	s.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			ctx, span := trace.StartSpan(ctx, "podAdd")
+			defer span.End()
 
-	var controller cache.Controller
-	_, controller = cache.NewInformer(
+			logger := log.G(ctx).WithField("method", "AddFunc")
 
-		&cache.ListWatch{
+			key, err := cache.MetaNamespaceKeyFunc(obj)
+			if err != nil {
+				span.SetStatus(trace.Status{Code: trace.StatusCodeInvalidArgument, Message: err.Error()})
+				logger.WithError(err).Error("error generating key for object on pod add handler")
+				return
+			}
 
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-				if controller != nil {
-					opts.ResourceVersion = controller.LastSyncResourceVersion()
-				}
+			logger = logger.WithField("key", key)
+			ctx = log.WithLogger(ctx, logger)
 
-				return s.k8sClient.Core().Pods(s.namespace).List(opts)
-			},
-
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-				if controller != nil {
-					opts.ResourceVersion = controller.LastSyncResourceVersion()
-				}
-
-				return s.k8sClient.Core().Pods(s.namespace).Watch(opts)
-			},
+			logger.Debug("Adding event to queue")
+			q.Add(event{ctx: ctx, key: key})
+			span.Annotate(nil, "added pod to queue")
 		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			ctx, span := trace.StartSpan(ctx, "podUpdate")
+			defer span.End()
+			logger := log.G(ctx).WithField("method", "UpdateFunc")
 
-		&corev1.Pod{},
+			key, err := cache.MetaNamespaceKeyFunc(newObj)
+			if err != nil {
+				span.SetStatus(trace.Status{Code: trace.StatusCodeInvalidArgument, Message: err.Error()})
+				log.G(ctx).WithError(err).Error("error generating key for object on pod delete handler")
+				return
+			}
 
-		time.Minute,
+			logger = logger.WithField("key", key)
+			ctx = log.WithLogger(ctx, logger)
 
-		cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				s.onAddPod(ctx, obj)
-			},
-			UpdateFunc: func(oldObj, newObj interface{}) {
-				s.onUpdatePod(ctx, newObj)
-			},
-			DeleteFunc: func(obj interface{}) {
-				s.onDeletePod(ctx, obj)
-			},
+			logger.Debug("Adding event to queue")
+			q.Add(event{ctx: ctx, key: key})
+			span.Annotate(nil, "added pod to queue")
 		},
-	)
+		DeleteFunc: func(obj interface{}) {
+			ctx, span := trace.StartSpan(ctx, "podDelete")
+			defer span.End()
+			logger := log.G(ctx).WithField("method", "DeleteFunc")
+
+			key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+			if err != nil {
+				span.SetStatus(trace.Status{Code: trace.StatusCodeInvalidArgument, Message: err.Error()})
+				logger.Error("error generating key for object on pod deleter handler")
+				return
+			}
+
+			logger = logger.WithField("key", key)
+			ctx = log.WithLogger(ctx, logger)
+
+			logger.Debug("Adding event to queue")
+			q.Add(event{ctx: ctx, key: key})
+		},
+	})
+
+	go s.informer.Run(ctx.Done())
+
+	if !cache.WaitForCacheSync(ctx.Done(), s.informer.HasSynced) {
+		return pkgerrors.Wrap(ctx.Err(), "error waiting for cache sync")
+	}
 
 	for i := 0; i < s.podSyncWorkers; i++ {
 		go s.startPodSynchronizer(ctx, i)
 	}
 
 	log.G(ctx).Info("Start to run pod cache controller.")
-	controller.Run(ctx.Done())
 
+	<-ctx.Done()
 	return ctx.Err()
 }

@@ -1518,13 +1518,14 @@
   revision = "9dfdf9be683f61f82cda12362c44c784e0778b56"
 
 [[projects]]
-  digest = "1:8802ddb9cfe9b59a4c5388d5ab5f81e1cd59af1a7a7fb90162bdba838fa37ce2"
+  digest = "1:30a1e39494e33ab108e272cbd0f0f36b8236774149fd74ae34133661b0a7e182"
   name = "k8s.io/kubernetes"
   packages = [
     "pkg/apis/core",
     "pkg/kubelet/apis/cri/runtime/v1alpha2",
     "pkg/kubelet/apis/stats/v1alpha1",
     "pkg/kubelet/server/remotecommand",
+    "staging/src/k8s.io/client-go/util/workqueue",
   ]
   pruneopts = "NUT"
   revision = "4ed3216f3ec431b140b1d899130a69fc671678f4"
@@ -1555,6 +1556,7 @@
     "github.com/Sirupsen/logrus",
     "github.com/aliyun/alibaba-cloud-sdk-go/sdk",
     "github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth",
+    "github.com/aliyun/alibaba-cloud-sdk-go/sdk/errors",
     "github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests",
     "github.com/aliyun/alibaba-cloud-sdk-go/sdk/responses",
     "github.com/aws/aws-sdk-go/aws",
@@ -1645,6 +1647,7 @@
     "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2",
     "k8s.io/kubernetes/pkg/kubelet/apis/stats/v1alpha1",
     "k8s.io/kubernetes/pkg/kubelet/server/remotecommand",
+    "k8s.io/kubernetes/staging/src/k8s.io/client-go/util/workqueue",
   ]
   solver-name = "gps-cdcl"
   solver-version = 1

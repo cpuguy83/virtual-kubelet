@@ -12,6 +12,8 @@ import (
 	"go.opencensus.io/trace"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/kubernetes/staging/src/k8s.io/client-go/util/workqueue"
 )
 
 const (
@@ -28,6 +30,8 @@ type Server struct {
 	resourceManager *manager.ResourceManager
 	podSyncWorkers  int
 	podCh           chan *podNotification
+	informer        cache.SharedInformer
+	queue           workqueue.RateLimitingInterface
 }
 
 // Config is used to configure a new server.
@@ -165,7 +169,7 @@ func (s *Server) reconcile(ctx context.Context) {
 		if err := s.deletePod(ctx, pod); err != nil {
 			logger.WithError(err).Error("Error deleting pod")
 			failedDeleteCount++
-			time.AfterFunc(5*time.Second, func(){
+			time.AfterFunc(5*time.Second, func() {
 				s.podCh <- &podNotification{pod: pod, ctx: ctx}
 			})
 			continue
@@ -234,7 +238,7 @@ func (s *Server) reconcile(ctx context.Context) {
 		if err = s.deletePod(ctx, pod); err != nil {
 			logger.WithError(err).Error("Error deleting pod")
 			failedCleanupCount++
-			time.AfterFunc(5*time.Second, func(){
+			time.AfterFunc(5*time.Second, func() {
 				s.podCh <- &podNotification{pod: pod, ctx: ctx}
 			})
 			continue
