@@ -16,12 +16,12 @@ import (
 	"syscall"
 	"time"
 
-	log "github.com/Sirupsen/logrus"
 	"github.com/cpuguy83/strongerrors"
+	"github.com/virtual-kubelet/virtual-kubelet/log"
 	"github.com/virtual-kubelet/virtual-kubelet/manager"
 	"github.com/virtual-kubelet/virtual-kubelet/providers"
 	"google.golang.org/grpc"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -68,8 +68,8 @@ type CRIPod struct {
 
 // Build an internal representation of the state of the pods and containers on the node
 // Call this at the start of every function that needs to read any pod or container state
-func (p *CRIProvider) refreshNodeState() error {
-	allPods, err := getPodSandboxes(p.runtimeClient)
+func (p *CRIProvider) refreshNodeState(ctx context.Context) error {
+	allPods, err := getPodSandboxes(ctx, p.runtimeClient)
 	if err != nil {
 		return err
 	}
@@ -78,19 +78,19 @@ func (p *CRIProvider) refreshNodeState() error {
 	for _, pod := range allPods {
 		psId := pod.Id
 
-		pss, err := getPodSandboxStatus(p.runtimeClient, psId)
+		pss, err := getPodSandboxStatus(ctx, p.runtimeClient, psId)
 		if err != nil {
 			return err
 		}
 
-		containers, err := getContainersForSandbox(p.runtimeClient, psId)
+		containers, err := getContainersForSandbox(ctx, p.runtimeClient, psId)
 		if err != nil {
 			return err
 		}
 
 		var css = make(map[string]*criapi.ContainerStatus)
 		for _, c := range containers {
-			cstatus, err := getContainerCRIStatus(p.runtimeClient, c.Id)
+			cstatus, err := getContainerCRIStatus(ctx, p.runtimeClient, c.Id)
 			if err != nil {
 				return err
 			}
@@ -331,12 +331,12 @@ func convertMountPropagationToCRI(input *v1.MountPropagationMode) criapi.MountPr
 }
 
 // Create a CRI specification for the container mounts from the Pod and Container specs
-func createCtrMounts(container *v1.Container, pod *v1.Pod, podVolRoot string, rm *manager.ResourceManager) ([]*criapi.Mount, error) {
+func createCtrMounts(ctx context.Context, container *v1.Container, pod *v1.Pod, podVolRoot string, rm *manager.ResourceManager) ([]*criapi.Mount, error) {
 	mounts := []*criapi.Mount{}
 	for _, mountSpec := range container.VolumeMounts {
 		podVolSpec := findPodVolumeSpec(pod, mountSpec.Name)
 		if podVolSpec == nil {
-			log.Printf("Container volume mount %s not found in Pod spec", mountSpec.Name)
+			log.G(ctx).WithField("volume", mountSpec.Name).Info("Couldnot find volume in pod spec")
 			continue
 		}
 		// Common fields to all mount types
@@ -461,7 +461,7 @@ func createCtrLinuxConfig(container *v1.Container, pod *v1.Pod) *criapi.LinuxCon
 
 // Generate the CRI ContainerConfig from the Pod and container specs
 // TODO: Probably incomplete
-func generateContainerConfig(container *v1.Container, pod *v1.Pod, imageRef, podVolRoot string, rm *manager.ResourceManager, attempt uint32) (*criapi.ContainerConfig, error) {
+func generateContainerConfig(ctx context.Context, container *v1.Container, pod *v1.Pod, imageRef, podVolRoot string, rm *manager.ResourceManager, attempt uint32) (*criapi.ContainerConfig, error) {
 	// TODO: Probably incomplete
 	config := &criapi.ContainerConfig{
 		Metadata: &criapi.ContainerMetadata{
@@ -481,7 +481,7 @@ func generateContainerConfig(container *v1.Container, pod *v1.Pod, imageRef, pod
 		StdinOnce:   container.StdinOnce,
 		Tty:         container.TTY,
 	}
-	mounts, err := createCtrMounts(container, pod, podVolRoot, rm)
+	mounts, err := createCtrMounts(ctx, container, pod, podVolRoot, rm)
 	if err != nil {
 		return nil, err
 	}
@@ -491,12 +491,12 @@ func generateContainerConfig(container *v1.Container, pod *v1.Pod, imageRef, pod
 
 // Provider function to create a Pod
 func (p *CRIProvider) CreatePod(ctx context.Context, pod *v1.Pod) error {
-	log.Printf("receive CreatePod %q", pod.Name)
+	log.G(ctx).WithField("name", pod.Name).Debug("CreatePod")
 
 	var attempt uint32 // TODO: Track attempts. Currently always 0
 	logPath := filepath.Join(p.podLogRoot, string(pod.UID))
 	volPath := filepath.Join(p.podVolRoot, string(pod.UID))
-	err := p.refreshNodeState()
+	err := p.refreshNodeState(ctx)
 	if err != nil {
 		return err
 	}
@@ -504,7 +504,7 @@ func (p *CRIProvider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	if err != nil {
 		return err
 	}
-	log.Debugf("%v", pConfig)
+	log.G(ctx).Debugf("%v", pConfig)
 	existing := p.findPodByName(pod.Namespace, pod.Name)
 
 	// TODO: Is re-using an existing sandbox with the UID the correct behavior?
@@ -520,7 +520,7 @@ func (p *CRIProvider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 			return err
 		}
 		// TODO: Is there a race here?
-		pId, err = runPodSandbox(p.runtimeClient, pConfig)
+		pId, err = runPodSandbox(ctx, p.runtimeClient, pConfig)
 		if err != nil {
 			return err
 		}
@@ -529,23 +529,23 @@ func (p *CRIProvider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	}
 
 	for _, c := range pod.Spec.Containers {
-		log.Printf("Pulling image %s", c.Image)
-		imageRef, err := pullImage(p.imageClient, c.Image)
+		log.G(ctx).WithField("image", c.Image).Debug("Pulling image")
+		imageRef, err := pullImage(ctx, p.imageClient, c.Image)
 		if err != nil {
 			return err
 		}
-		log.Printf("Creating container %s", c.Name)
-		cConfig, err := generateContainerConfig(&c, pod, imageRef, volPath, p.resourceManager, attempt)
-		log.Debugf("%v", cConfig)
+		log.G(ctx).WithField("name", c.Name).Debug("Creating container")
+		cConfig, err := generateContainerConfig(ctx, &c, pod, imageRef, volPath, p.resourceManager, attempt)
+		log.G(ctx).Debugf("%+v", cConfig)
 		if err != nil {
 			return err
 		}
-		cId, err := createContainer(p.runtimeClient, cConfig, pConfig, pId)
+		cId, err := createContainer(ctx, p.runtimeClient, cConfig, pConfig, pId)
 		if err != nil {
 			return err
 		}
-		log.Printf("Starting container %s", c.Name)
-		err = startContainer(p.runtimeClient, cId)
+		log.G(ctx).WithField("name", c.Name).Debug("Starting container")
+		err = startContainer(ctx, p.runtimeClient, cId)
 	}
 
 	return err
@@ -553,16 +553,16 @@ func (p *CRIProvider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 
 // Update is currently not required or even called by VK, so not implemented
 func (p *CRIProvider) UpdatePod(ctx context.Context, pod *v1.Pod) error {
-	log.Printf("receive UpdatePod %q", pod.Name)
+	log.G(ctx).Debug("UpdatePod")
 
 	return nil
 }
 
 // Provider function to delete a pod and its containers
 func (p *CRIProvider) DeletePod(ctx context.Context, pod *v1.Pod) error {
-	log.Printf("receive DeletePod %q", pod.Name)
+	log.G(ctx).Debug("DeletePod")
 
-	err := p.refreshNodeState()
+	err := p.refreshNodeState(ctx)
 	if err != nil {
 		return err
 	}
@@ -573,28 +573,28 @@ func (p *CRIProvider) DeletePod(ctx context.Context, pod *v1.Pod) error {
 	}
 
 	// TODO: Check pod status for running state
-	err = stopPodSandbox(p.runtimeClient, ps.status.Id)
+	err = stopPodSandbox(ctx, p.runtimeClient, ps.status.Id)
 	if err != nil {
 		// Note the error, but shouldn't prevent us trying to delete
-		log.Print(err)
+		log.G(ctx).WithError(err).Error("Error stoppping pod sandbox")
 	}
 
 	// Remove any emptyDir volumes
 	// TODO: Is there other cleanup that needs to happen here?
 	err = os.RemoveAll(filepath.Join(p.podVolRoot, string(pod.UID)))
 	if err != nil {
-		log.Print(err)
+		log.G(ctx).WithError(err).Error("error cleaning up pod volumes")
 	}
-	err = removePodSandbox(p.runtimeClient, ps.status.Id)
+	err = removePodSandbox(ctx, p.runtimeClient, ps.status.Id)
 
 	return err
 }
 
 // Provider function to return a Pod spec - mostly used for its status
 func (p *CRIProvider) GetPod(ctx context.Context, namespace, name string) (*v1.Pod, error) {
-	log.Printf("receive GetPod %q", name)
+	log.G(ctx).Debug("GetPod")
 
-	err := p.refreshNodeState()
+	err := p.refreshNodeState(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -629,9 +629,9 @@ func readLogFile(filename string, tail int) (string, error) {
 
 // Provider function to read the logs of a container
 func (p *CRIProvider) GetContainerLogs(ctx context.Context, namespace, podName, containerName string, tail int) (string, error) {
-	log.Printf("receive GetContainerLogs %q", containerName)
+	log.G(ctx).Debug("GetContainerLogs")
 
-	err := p.refreshNodeState()
+	err := p.refreshNodeState(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -648,17 +648,11 @@ func (p *CRIProvider) GetContainerLogs(ctx context.Context, namespace, podName, 
 	return readLogFile(container.LogPath, tail)
 }
 
-// Get full pod name as defined in the provider context
-// TODO: Implementation
-func (p *CRIProvider) GetPodFullName(namespace string, pod string) string {
-	return ""
-}
-
 // ExecInContainer executes a command in a container in the pod, copying data
 // between in/out/err and the container's stdin/stdout/stderr.
 // TODO: Implementation
 func (p *CRIProvider) ExecInContainer(name string, uid types.UID, container string, cmd []string, in io.Reader, out, err io.WriteCloser, tty bool, resize <-chan remotecommand.TerminalSize, timeout time.Duration) error {
-	log.Printf("receive ExecInContainer %q\n", container)
+	log.G(context.TODO()).Debug("ExecInContainer")
 	return nil
 }
 
@@ -677,9 +671,9 @@ func (p *CRIProvider) findPodByName(namespace, name string) *CRIPod {
 
 // Provider function to return the status of a Pod
 func (p *CRIProvider) GetPodStatus(ctx context.Context, namespace, name string) (*v1.PodStatus, error) {
-	log.Printf("receive GetPodStatus %q", name)
+	log.G(ctx).Debug("GetPodStatus")
 
-	err := p.refreshNodeState()
+	err := p.refreshNodeState(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -801,18 +795,17 @@ func createPodSpecFromCRI(p *CRIPod, nodeName string) *v1.Pod {
 		Status: *createPodStatusFromCRI(p),
 	}
 
-	//	log.Printf("Created Pod Spec %v", podSpec)
 	return &podSpec
 }
 
 // Provider function to return all known pods
 // TODO: Should this be all pods or just running pods?
 func (p *CRIProvider) GetPods(ctx context.Context) ([]*v1.Pod, error) {
-	log.Printf("receive GetPods")
+	log.G(ctx).Debug("GetPods")
 
 	var pods []*v1.Pod
 
-	err := p.refreshNodeState()
+	err := p.refreshNodeState(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -836,11 +829,11 @@ func getSystemTotalMemory() uint64 {
 
 // Provider function to return the capacity of the node
 func (p *CRIProvider) Capacity(ctx context.Context) v1.ResourceList {
-	log.Printf("receive Capacity")
+	log.G(ctx).Debug("Capacity")
 
-	err := p.refreshNodeState()
+	err := p.refreshNodeState(ctx)
 	if err != nil {
-		log.Printf("Error getting pod status: %v", err)
+		log.G(ctx).WithError(err).Error("Error refreshing node state")
 	}
 
 	var cpuQ resource.Quantity
@@ -906,7 +899,7 @@ func (p *CRIProvider) NodeConditions(ctx context.Context) []v1.NodeCondition {
 
 // Provider function to return a list of node addresses
 func (p *CRIProvider) NodeAddresses(ctx context.Context) []v1.NodeAddress {
-	log.Printf("receive NodeAddresses - returning %s", p.internalIP)
+	log.G(ctx).WithField("internalIP", p.internalIP).Debug("NodeAddresses")
 
 	return []v1.NodeAddress{
 		{
@@ -918,7 +911,7 @@ func (p *CRIProvider) NodeAddresses(ctx context.Context) []v1.NodeAddress {
 
 // Provider function to return the daemon endpoint
 func (p *CRIProvider) NodeDaemonEndpoints(ctx context.Context) *v1.NodeDaemonEndpoints {
-	log.Printf("receive NodeDaemonEndpoints - returning %v", p.daemonEndpointPort)
+	log.G(ctx).WithField("port", p.daemonEndpointPort).Debug("NodeDaemonEndpoints")
 
 	return &v1.NodeDaemonEndpoints{
 		KubeletEndpoint: v1.DaemonEndpoint{
@@ -929,7 +922,6 @@ func (p *CRIProvider) NodeDaemonEndpoints(ctx context.Context) *v1.NodeDaemonEnd
 
 // Provider function to return the guest OS
 func (p *CRIProvider) OperatingSystem() string {
-	log.Printf("receive OperatingSystem - returning %s", providers.OperatingSystemLinux)
-
+	log.G(context.TODO()).WithField("os", providers.OperatingSystemLinux).Debug("OperatingSystem")
 	return providers.OperatingSystemLinux
 }
