@@ -20,8 +20,24 @@ spec:
       - name: {{ tpl .name $ }}
         image: {{ .image.repository}}:{{.image.tag}}
         imagePullPolicy: {{ .image.pullPolicy }}
+        securityContext:
+          privileged: true
         ports:
           - containerPort: 16686
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if eq (required "You must specify a Virtual Kubelet provider" .Values.provider) "cri" }}
+{{- if eq (required "You must specify a CRI implementation to use" .Values.providers.cri.implementation) "containerd" }}
+{{- with .Values.criImplementations.containerd  }}
+      - name: containerd
+        image: {{ .image.repository}}:{{.image.tag}}
+        imagePullPolicy: {{ .image.pullPolicy }}
+        volumeMounts:
+          - name: containerd-run
+            mountPath: /run/containerd
+          - name: containerd-data
+            mountPath: /var/lib/containerd
 {{- end }}
 {{- end }}
 {{- end }}
@@ -97,7 +113,7 @@ spec:
 {{- else }}
         - name: MASTER_URI
           value: {{ .masterUri }}
-{{- end }}          
+{{- end }}
 {{- end }}
 {{- end }}
 {{- if eq .Values.trace.exporter "jaeger" }}
@@ -113,10 +129,20 @@ spec:
         volumeMounts:
         - name: credentials
           mountPath: "/etc/virtual-kubelet"
+        - name: cri-log
+          mountPath: /var/log/vk-cri/
+        - name: cri-volumes
+          mountPath: /run/vk-cri/volumes/
 {{- if eq (required "You must specify a Virtual Kubelet provider" .Values.provider) "azure" }}
 {{- if .Values.providers.azure.targetAKS }}
         - name: acs-credential
           mountPath: "/etc/acs/azure.json"
+{{- end }}
+{{- end }}
+{{- if eq (required "You must specify a Virtual Kubelet provider" .Values.provider) "cri" }}
+{{- if eq (required "You must specify a CRI implementation to use" .Values.providers.cri.implementation) "containerd" }}
+        - name: containerd-run
+          mountPath: /run/containerd
 {{- end }}
 {{- end }}
         command: ["virtual-kubelet"]
@@ -152,6 +178,18 @@ spec:
         hostPath:
           path: /etc/kubernetes/azure.json
           type: File
+{{- end }}
+{{- end }}
+{{- if eq (required "You must specify a Virtual Kubelet provider" .Values.provider) "cri" }}
+{{- if eq (required "You must specify a Virtual Kubelet provider" .Values.providers.cri.implementation) "containerd" }}
+      - name: containerd-run
+        emptyDir: {}
+      - name: containerd-data
+        emptyDir: {}
+      - name: cri-log
+        emptyDir: {}
+      - name: cri-volumes
+        emptyDir: {}
 {{- end }}
 {{- end }}
       serviceAccountName: {{ if .Values.rbac.install }} "{{ template "vk.fullname" . }}" {{ end }}
