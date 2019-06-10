@@ -17,10 +17,10 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/virtual-kubelet/virtual-kubelet/api"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/manager"
 	"github.com/virtual-kubelet/virtual-kubelet/providers"
-	"github.com/virtual-kubelet/virtual-kubelet/vkubelet/api"
 	"google.golang.org/grpc"
 	v1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"

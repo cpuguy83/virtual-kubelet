@@ -33,7 +33,7 @@ defined in this package which is used for these helpers.
 Note: The metrics routes may need to be attached to a different HTTP server,
 depending on your configuration.
 
-For more fine-grained control over the API, see the `vkubelet/api` package which
+For more fine-grained control over the API, see the `api` package which
 only implements the HTTP handlers that you can use in whatever way you want.
 
 This uses open-cenesus to implement tracing (but no internal metrics yet) which

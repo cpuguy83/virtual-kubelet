@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/virtual-kubelet/virtual-kubelet/api"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	"github.com/virtual-kubelet/virtual-kubelet/trace"
-	"github.com/virtual-kubelet/virtual-kubelet/vkubelet/api"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

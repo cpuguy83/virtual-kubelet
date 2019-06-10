@@ -12,8 +12,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go/service/ecs"
+	"github.com/virtual-kubelet/virtual-kubelet/api"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
-	"github.com/virtual-kubelet/virtual-kubelet/vkubelet/api"
 	k8sTypes "k8s.io/apimachinery/pkg/types"
 )
 
