@@ -24,7 +24,7 @@ func (ts *EndToEndTestSuite) TestGetPods(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a pod with prefix "nginx-" having a single container.
-	podSpec := f.CreateDummyPodObjectWithPrefix(t.Name(), "nginx", "foo")
+	podSpec := f.CreateDummyPodObjectWithPrefix(t.Name(), "nginx", 1)
 	podSpec.Spec.NodeName = f.NodeName
 
 	nginx, err := f.CreatePod(ctx, podSpec)
@@ -70,7 +70,7 @@ func (ts *EndToEndTestSuite) TestGetStatsSummary(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a pod with prefix "nginx-" having three containers.
-	pod, err := f.CreatePod(ctx, f.CreateDummyPodObjectWithPrefix(t.Name(), "nginx", "foo", "bar", "baz"))
+	pod, err := f.CreatePod(ctx, f.CreateDummyPodObjectWithPrefix(t.Name(), "nginx", 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func (ts *EndToEndTestSuite) TestPodLifecycleGracefulDelete(t *testing.T) {
 	ctx := context.Background()
 
 	// Create a pod with prefix "nginx-" having a single container.
-	podSpec := f.CreateDummyPodObjectWithPrefix(t.Name(), "nginx", "foo")
+	podSpec := f.CreateDummyPodObjectWithPrefix(t.Name(), "nginx", 1)
 	podSpec.Spec.NodeName = f.NodeName
 
 	pod, err := f.CreatePod(ctx, podSpec)
@@ -193,7 +193,7 @@ func (ts *EndToEndTestSuite) TestPodLifecycleGracefulDelete(t *testing.T) {
 func (ts *EndToEndTestSuite) TestPodLifecycleForceDelete(t *testing.T) {
 	ctx := context.Background()
 
-	podSpec := f.CreateDummyPodObjectWithPrefix(t.Name(), "nginx", "foo")
+	podSpec := f.CreateDummyPodObjectWithPrefix(t.Name(), "nginx", 1)
 	// Create a pod with prefix having a single container.
 	pod, err := f.CreatePod(ctx, podSpec)
 	if err != nil {

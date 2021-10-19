@@ -15,11 +15,15 @@ import (
 	"k8s.io/client-go/tools/watch"
 )
 
+var (
+	TestImageName = "busybox:latest"
+	TestCmd       = []string{"top"}
+)
+
 // CreateDummyPodObjectWithPrefix creates a dujmmy pod object using the specified prefix as the value of .metadata.generateName.
-// A variable number of strings can be provided.
-// For each one of these strings, a container that uses the string as its image will be appended to the pod.
+// A count of the number of containers to inject into the pod spec can be specified.
 // This method DOES NOT create the pod in the Kubernetes API.
-func (f *Framework) CreateDummyPodObjectWithPrefix(testName string, prefix string, images ...string) *corev1.Pod {
+func (f *Framework) CreateDummyPodObjectWithPrefix(testName string, prefix string, count int) *corev1.Pod {
 	// Safe the test name
 	if testName != "" {
 		testName = stripParentTestName(strings.ToLower(testName))
@@ -37,10 +41,11 @@ func (f *Framework) CreateDummyPodObjectWithPrefix(testName string, prefix strin
 			EnableServiceLinks: &enableServiceLink,
 		},
 	}
-	for idx, img := range images {
+	for i := 0; i < count; i++ {
 		pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
-			Name:  fmt.Sprintf("%s%d", prefix, idx),
-			Image: img,
+			Name:    fmt.Sprintf("%s%d", prefix, i),
+			Image:   TestImageName,
+			Command: TestCmd,
 		})
 	}
 	return pod
